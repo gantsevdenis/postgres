@@ -323,7 +323,7 @@ PostgreSQL documentation
       <term><option>--if-exists</option></term>
       <listitem>
        <para>
-        Use conditional commands (i.e. add an <literal>IF EXISTS</literal>
+        Use conditional commands (i.e., add an <literal>IF EXISTS</literal>
         clause) to drop databases and other objects.  This option is not valid
         unless <option>--clean</option> is also specified.
        </para>
@@ -701,8 +701,8 @@ PostgreSQL documentation
     <term><envar>PG_COLOR</envar></term>
     <listitem>
      <para>
-      Specifies whether to use color in diagnostics messages.  Possible values
-      are <literal>always</literal>, <literal>auto</literal>,
+      Specifies whether to use color in diagnostic messages. Possible values
+      are <literal>always</literal>, <literal>auto</literal> and
       <literal>never</literal>.
      </para>
     </listitem>

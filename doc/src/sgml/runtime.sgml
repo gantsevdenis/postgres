@@ -1245,7 +1245,7 @@ project.max-msg-ids=(priv,4096,deny)
 
    <para>
     If <productname>systemd</productname> is in use, some care must be taken
-    that IPC resources (shared memory and semaphores) are not prematurely
+    that IPC resources (including shared memory) are not prematurely
     removed by the operating system.  This is especially of concern when
     installing PostgreSQL from source.  Users of distribution packages of
     PostgreSQL are less likely to be affected, as
@@ -1262,11 +1262,12 @@ project.max-msg-ids=(priv,4096,deny)
    </para>
 
    <para>
-    A typical observed effect when this setting is on is that the semaphore
-    objects used by a PostgreSQL server are removed at apparently random
-    times, leading to the server crashing with log messages like
+    A typical observed effect when this setting is on is that shared memory
+    objects used for parallel query execution are removed at apparently random
+    times, leading to errors and warnings while attempting to open and remove
+    them, like
 <screen>
-LOG: semctl(1234567890, 0, IPC_RMID, ...) failed: Invalid argument
+WARNING:  could not remove shared memory segment "/PostgreSQL.1450751626": No such file or directory
 </screen>
     Different types of IPC objects (shared memory vs. semaphores, System V
     vs. POSIX) are treated slightly differently
@@ -1995,7 +1996,7 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
     be migrated in-place from one major <productname>PostgreSQL</productname>
     version to another.  Upgrades can be performed in minutes,
     particularly with <option>--link</option> mode.  It requires steps similar to
-    <application>pg_dumpall</application> above, e.g.  starting/stopping the server,
+    <application>pg_dumpall</application> above, e.g.,  starting/stopping the server,
     running <application>initdb</application>.  The <application>pg_upgrade</application> <link
     linkend="pgupgrade">documentation</link> outlines the necessary steps.
    </para>
@@ -2323,8 +2324,10 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
    The certificates of <quote>intermediate</quote> certificate authorities
    can also be appended to the file.  Doing this avoids the necessity of
    storing intermediate certificates on clients, assuming the root and
-   intermediate certificates were created with <literal>v3_ca</literal>
-   extensions.  This allows easier expiration of intermediate certificates.
+   intermediate certificates were created with <literal>v3_ca </literal>
+   extensions.  (This sets the certificate's basic constraint of
+   <literal>CA</literal> to <literal>true</literal>.)
+   This allows easier expiration of intermediate certificates.
   </para>
 
   <para>
@@ -2404,9 +2407,6 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
    intermediate certificates were created with <literal>v3_ca</literal>
    extensions).  Certificate Revocation List (CRL) entries are also
    checked if the parameter <xref linkend="guc-ssl-crl-file"/> is set.
-   (See <ulink
-   url="http://h41379.www4.hpe.com/doc/83final/ba554_90007/ch04s02.html"></ulink>
-   for diagrams showing SSL certificate usage.)
   </para>
 
   <para>

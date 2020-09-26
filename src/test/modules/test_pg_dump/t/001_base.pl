@@ -135,6 +135,12 @@ my %pgdump_runs = (
 			"$tempdir/defaults_tar_format.tar",
 		],
 	},
+	extension_schema => {
+		dump_cmd => [
+			'pg_dump', '--schema=public', '--inserts',
+			"--file=$tempdir/extension_schema.sql", 'postgres',
+		],
+	},
 	pg_dumpall_globals => {
 		dump_cmd => [
 			'pg_dumpall',                             '--no-sync',
@@ -301,8 +307,9 @@ my %tests = (
 			\n/xm,
 		like => {
 			%full_runs,
-			data_only    => 1,
-			section_data => 1,
+			data_only        => 1,
+			section_data     => 1,
+			extension_schema => 1,
 		},
 	},
 
@@ -523,6 +530,40 @@ my %tests = (
 		like => { binary_upgrade => 1, },
 	},
 
+	'ALTER INDEX pkey DEPENDS ON extension' => {
+		create_order => 11,
+		create_sql =>
+		  'CREATE TABLE regress_pg_dump_schema.extdependtab (col1 integer primary key, col2 int);
+		CREATE INDEX ON regress_pg_dump_schema.extdependtab (col2);
+		ALTER INDEX regress_pg_dump_schema.extdependtab_col2_idx DEPENDS ON EXTENSION test_pg_dump;
+		ALTER INDEX regress_pg_dump_schema.extdependtab_pkey DEPENDS ON EXTENSION test_pg_dump;',
+		regexp => qr/^
+		\QALTER INDEX regress_pg_dump_schema.extdependtab_pkey DEPENDS ON EXTENSION test_pg_dump;\E\n
+		/xms,
+		like   => {%pgdump_runs},
+		unlike => {
+			data_only          => 1,
+			extension_schema   => 1,
+			pg_dumpall_globals => 1,
+			section_data       => 1,
+			section_pre_data   => 1,
+		},
+	},
+
+	'ALTER INDEX idx DEPENDS ON extension' => {
+		regexp => qr/^
+			\QALTER INDEX regress_pg_dump_schema.extdependtab_col2_idx DEPENDS ON EXTENSION test_pg_dump;\E\n
+			/xms,
+		like   => {%pgdump_runs},
+		unlike => {
+			data_only          => 1,
+			extension_schema   => 1,
+			pg_dumpall_globals => 1,
+			section_data       => 1,
+			section_pre_data   => 1,
+		},
+	},
+
 	# Objects not included in extension, part of schema created by extension
 	'CREATE TABLE regress_pg_dump_schema.external_tab' => {
 		create_order => 4,
@@ -536,6 +577,17 @@ my %tests = (
 			%full_runs,
 			schema_only      => 1,
 			section_pre_data => 1,
+		},
+	},
+
+	# Dumpable object inside specific schema
+	'INSERT INTO public.regress_table_dumpable VALUES (1);' => {
+		create_sql   => 'INSERT INTO public.regress_table_dumpable VALUES (1);',
+		regexp       => qr/^
+			\QINSERT INTO public.regress_table_dumpable VALUES (1);\E
+			\n/xm,
+		like => {
+			extension_schema => 1,
 		},
 	},);
 

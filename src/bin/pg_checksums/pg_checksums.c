@@ -92,20 +92,31 @@ usage(void)
 }
 
 /*
+ * Definition of one element part of an exclusion list, used for files
+ * to exclude from checksum validation.  "name" is the name of the file
+ * or path to check for exclusion.  If "match_prefix" is true, any items
+ * matching the name as prefix are excluded.
+ */
+struct exclude_list_item
+{
+	const char *name;
+	bool		match_prefix;
+};
+
+/*
  * List of files excluded from checksum validation.
  *
  * Note: this list should be kept in sync with what basebackup.c includes.
  */
-static const char *const skip[] = {
-	"pg_control",
-	"pg_filenode.map",
-	"pg_internal.init",
-	"PG_VERSION",
+static const struct exclude_list_item skip[] = {
+	{"pg_control", false},
+	{"pg_filenode.map", false},
+	{"pg_internal.init", true},
+	{"PG_VERSION", false},
 #ifdef EXEC_BACKEND
-	"config_exec_params",
-	"config_exec_params.new",
+	{"config_exec_params", true},
 #endif
-	NULL,
+	{NULL, false}
 };
 
 /*
@@ -113,7 +124,7 @@ static const char *const skip[] = {
  * src/bin/pg_basebackup/pg_basebackup.c.
  */
 static void
-progress_report(bool force)
+progress_report(bool finished)
 {
 	int			percent;
 	char		total_size_str[32];
@@ -123,7 +134,7 @@ progress_report(bool force)
 	Assert(showprogress);
 
 	now = time(NULL);
-	if (now == last_progress_report && !force)
+	if (now == last_progress_report && !finished)
 		return;					/* Max once per second */
 
 	/* Save current time */
@@ -150,18 +161,27 @@ progress_report(bool force)
 			(int) strlen(current_size_str), current_size_str, total_size_str,
 			percent);
 
-	/* Stay on the same line if reporting to a terminal */
-	fprintf(stderr, isatty(fileno(stderr)) ? "\r" : "\n");
+	/*
+	 * Stay on the same line if reporting to a terminal and we're not done
+	 * yet.
+	 */
+	fputc((!finished && isatty(fileno(stderr))) ? '\r' : '\n', stderr);
 }
 
 static bool
 skipfile(const char *fn)
 {
-	const char *const *f;
+	int			excludeIdx;
 
-	for (f = skip; *f; f++)
-		if (strcmp(*f, fn) == 0)
+	for (excludeIdx = 0; skip[excludeIdx].name != NULL; excludeIdx++)
+	{
+		int			cmplen = strlen(skip[excludeIdx].name);
+
+		if (!skip[excludeIdx].match_prefix)
+			cmplen++;
+		if (strncmp(skip[excludeIdx].name, fn, cmplen) == 0)
 			return true;
+	}
 
 	return false;
 }
@@ -368,7 +388,52 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 #else
 		else if (S_ISDIR(st.st_mode) || pgwin32_is_junction(fn))
 #endif
-			dirsize += scan_directory(path, de->d_name, sizeonly);
+		{
+			/*
+			 * If going through the entries of pg_tblspc, we assume to operate
+			 * on tablespace locations where only TABLESPACE_VERSION_DIRECTORY
+			 * is valid, resolving the linked locations and dive into them
+			 * directly.
+			 */
+			if (strncmp("pg_tblspc", subdir, strlen("pg_tblspc")) == 0)
+			{
+				char		tblspc_path[MAXPGPATH];
+				struct stat tblspc_st;
+
+				/*
+				 * Resolve tablespace location path and check whether
+				 * TABLESPACE_VERSION_DIRECTORY exists.  Not finding a valid
+				 * location is unexpected, since there should be no orphaned
+				 * links and no links pointing to something else than a
+				 * directory.
+				 */
+				snprintf(tblspc_path, sizeof(tblspc_path), "%s/%s/%s",
+						 path, de->d_name, TABLESPACE_VERSION_DIRECTORY);
+
+				if (lstat(tblspc_path, &tblspc_st) < 0)
+				{
+					pg_log_error("could not stat file \"%s\": %m",
+								 tblspc_path);
+					exit(1);
+				}
+
+				/*
+				 * Move backwards once as the scan needs to happen for the
+				 * contents of TABLESPACE_VERSION_DIRECTORY.
+				 */
+				snprintf(tblspc_path, sizeof(tblspc_path), "%s/%s",
+						 path, de->d_name);
+
+				/* Looks like a valid tablespace location */
+				dirsize += scan_directory(tblspc_path,
+										  TABLESPACE_VERSION_DIRECTORY,
+										  sizeonly);
+			}
+			else
+			{
+				dirsize += scan_directory(path, de->d_name, sizeonly);
+			}
+		}
 	}
 	closedir(dir);
 	return dirsize;
@@ -561,10 +626,7 @@ main(int argc, char *argv[])
 		(void) scan_directory(DataDir, "pg_tblspc", false);
 
 		if (showprogress)
-		{
 			progress_report(true);
-			fprintf(stderr, "\n");	/* Need to move to next line */
-		}
 
 		printf(_("Checksum operation completed\n"));
 		printf(_("Files scanned:  %s\n"), psprintf(INT64_FORMAT, files));

@@ -455,6 +455,11 @@ pqDropConnection(PGconn *conn, bool flushInput)
 	{
 		OM_uint32	min_s;
 
+		if (conn->gcred != GSS_C_NO_CREDENTIAL)
+		{
+			gss_release_cred(&min_s, &conn->gcred);
+			conn->gcred = GSS_C_NO_CREDENTIAL;
+		}
 		if (conn->gctx)
 			gss_delete_sec_context(&min_s, &conn->gctx, GSS_C_NO_BUFFER);
 		if (conn->gtarg_nam)
@@ -474,6 +479,7 @@ pqDropConnection(PGconn *conn, bool flushInput)
 			free(conn->gss_ResultBuffer);
 			conn->gss_ResultBuffer = NULL;
 		}
+		conn->gssenc = false;
 	}
 #endif
 #ifdef ENABLE_SSPI
@@ -1936,11 +1942,6 @@ connectDBStart(PGconn *conn)
 	 */
 	resetPQExpBuffer(&conn->errorMessage);
 
-#ifdef ENABLE_GSS
-	if (conn->gssencmode[0] == 'd') /* "disable" */
-		conn->try_gss = false;
-#endif
-
 	/*
 	 * Set up to try to connect to the first host.  (Setting whichhost = -1 is
 	 * a bit of a cheat, but PQconnectPoll will advance it to 0 before
@@ -2379,6 +2380,9 @@ keep_going:						/* We will come back to here until there is
 		/* initialize these values based on SSL mode */
 		conn->allow_ssl_try = (conn->sslmode[0] != 'd');	/* "disable" */
 		conn->wait_ssl_try = (conn->sslmode[0] == 'a'); /* "allow" */
+#endif
+#ifdef ENABLE_GSS
+		conn->try_gss = (conn->gssencmode[0] != 'd');	/* "disable" */
 #endif
 
 		reset_connection_state_machine = false;
@@ -3259,12 +3263,8 @@ keep_going:						/* We will come back to here until there is
 					 */
 					if (conn->gssenc && conn->gssencmode[0] == 'p')
 					{
-						OM_uint32	minor;
-
 						/* postmaster expects us to drop the connection */
 						conn->try_gss = false;
-						conn->gssenc = false;
-						gss_delete_sec_context(&minor, &conn->gctx, NULL);
 						pqDropConnection(conn, true);
 						conn->status = CONNECTION_NEEDED;
 						goto keep_going;
@@ -3838,9 +3838,6 @@ makeEmptyPGconn(void)
 	conn->verbosity = PQERRORS_DEFAULT;
 	conn->show_context = PQSHOW_CONTEXT_ERRORS;
 	conn->sock = PGINVALID_SOCKET;
-#ifdef ENABLE_GSS
-	conn->try_gss = true;
-#endif
 
 	/*
 	 * We try to send at least 8K at a time, which is the usual size of pipe
@@ -3980,22 +3977,6 @@ freePGconn(PGconn *conn)
 		free(conn->gsslib);
 	if (conn->connip)
 		free(conn->connip);
-#ifdef ENABLE_GSS
-	if (conn->gcred != GSS_C_NO_CREDENTIAL)
-	{
-		OM_uint32	minor;
-
-		gss_release_cred(&minor, &conn->gcred);
-		conn->gcred = GSS_C_NO_CREDENTIAL;
-	}
-	if (conn->gctx)
-	{
-		OM_uint32	minor;
-
-		gss_delete_sec_context(&minor, &conn->gctx, GSS_C_NO_BUFFER);
-		conn->gctx = NULL;
-	}
-#endif
 	/* Note that conn->Pfdebug is not ours to close or free */
 	if (conn->last_query)
 		free(conn->last_query);
@@ -6868,9 +6849,7 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 {
 	FILE	   *fp;
 	struct stat stat_buf;
-
-#define LINELEN NAMEDATALEN*5
-	char		buf[LINELEN];
+	PQExpBufferData buf;
 
 	if (dbname == NULL || dbname[0] == '\0')
 		return NULL;
@@ -6926,63 +6905,81 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 	if (fp == NULL)
 		return NULL;
 
+	/* Use an expansible buffer to accommodate any reasonable line length */
+	initPQExpBuffer(&buf);
+
 	while (!feof(fp) && !ferror(fp))
 	{
-		char	   *t = buf,
-				   *ret,
-				   *p1,
-				   *p2;
-		int			len;
-
-		if (fgets(buf, sizeof(buf), fp) == NULL)
+		/* Make sure there's a reasonable amount of room in the buffer */
+		if (!enlargePQExpBuffer(&buf, 128))
 			break;
 
-		len = strlen(buf);
+		/* Read some data, appending it to what we already have */
+		if (fgets(buf.data + buf.len, buf.maxlen - buf.len, fp) == NULL)
+			break;
+		buf.len += strlen(buf.data + buf.len);
 
-		/* Remove trailing newline */
-		if (len > 0 && buf[len - 1] == '\n')
-		{
-			buf[--len] = '\0';
-			/* Handle DOS-style line endings, too, even when not on Windows */
-			if (len > 0 && buf[len - 1] == '\r')
-				buf[--len] = '\0';
-		}
-
-		if (len == 0)
+		/* If we don't yet have a whole line, loop around to read more */
+		if (!(buf.len > 0 && buf.data[buf.len - 1] == '\n') && !feof(fp))
 			continue;
 
-		if ((t = pwdfMatchesString(t, hostname)) == NULL ||
-			(t = pwdfMatchesString(t, port)) == NULL ||
-			(t = pwdfMatchesString(t, dbname)) == NULL ||
-			(t = pwdfMatchesString(t, username)) == NULL)
-			continue;
-
-		/* Found a match. */
-		ret = strdup(t);
-		fclose(fp);
-
-		if (!ret)
+		/* ignore comments */
+		if (buf.data[0] != '#')
 		{
-			/* Out of memory. XXX: an error message would be nice. */
-			return NULL;
+			char	   *t = buf.data;
+			int			len = buf.len;
+
+			/* Remove trailing newline */
+			if (len > 0 && t[len - 1] == '\n')
+			{
+				t[--len] = '\0';
+				/* Handle DOS-style line endings, too */
+				if (len > 0 && t[len - 1] == '\r')
+					t[--len] = '\0';
+			}
+
+			if (len > 0 &&
+				(t = pwdfMatchesString(t, hostname)) != NULL &&
+				(t = pwdfMatchesString(t, port)) != NULL &&
+				(t = pwdfMatchesString(t, dbname)) != NULL &&
+				(t = pwdfMatchesString(t, username)) != NULL)
+			{
+				/* Found a match. */
+				char	   *ret,
+						   *p1,
+						   *p2;
+
+				ret = strdup(t);
+
+				fclose(fp);
+				termPQExpBuffer(&buf);
+
+				if (!ret)
+				{
+					/* Out of memory. XXX: an error message would be nice. */
+					return NULL;
+				}
+
+				/* De-escape password. */
+				for (p1 = p2 = ret; *p1 != ':' && *p1 != '\0'; ++p1, ++p2)
+				{
+					if (*p1 == '\\' && p1[1] != '\0')
+						++p1;
+					*p2 = *p1;
+				}
+				*p2 = '\0';
+
+				return ret;
+			}
 		}
 
-		/* De-escape password. */
-		for (p1 = p2 = ret; *p1 != ':' && *p1 != '\0'; ++p1, ++p2)
-		{
-			if (*p1 == '\\' && p1[1] != '\0')
-				++p1;
-			*p2 = *p1;
-		}
-		*p2 = '\0';
-
-		return ret;
+		/* No match, reset buffer to prepare for next line. */
+		buf.len = 0;
 	}
 
 	fclose(fp);
+	termPQExpBuffer(&buf);
 	return NULL;
-
-#undef LINELEN
 }
 
 
