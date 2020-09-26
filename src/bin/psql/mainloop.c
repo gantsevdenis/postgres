@@ -75,6 +75,7 @@ MainLoop(FILE *source)
 	query_buf = createPQExpBuffer();
 	previous_buf = createPQExpBuffer();
 	history_buf = createPQExpBuffer();
+
 	if (PQExpBufferBroken(query_buf) ||
 		PQExpBufferBroken(previous_buf) ||
 		PQExpBufferBroken(history_buf))

@@ -49,6 +49,7 @@
 #include "common.h"
 #include "settings.h"
 #include "stringutils.h"
+#include "nqscan.h"
 
 #ifdef HAVE_RL_FILENAME_COMPLETION_FUNCTION
 #define filename_completion_function rl_filename_completion_function
@@ -1095,6 +1096,7 @@ static char *_complete_from_query(const char *simple_query,
 								  const SchemaQuery *schema_query,
 								  const char *text, int state);
 static char *complete_from_list(const char *text, int state);
+static char *complete_from_named_queries_generator(const char *text, int state);
 static char *complete_from_const(const char *text, int state);
 static void append_variable_names(char ***varnames, int *nvars,
 								  int *maxvars, const char *varname,
@@ -1430,6 +1432,7 @@ psql_completion(const char *text, int start, int end)
 		"\\h", "\\help", "\\H",
 		"\\i", "\\if", "\\ir",
 		"\\l", "\\lo_import", "\\lo_export", "\\lo_list", "\\lo_unlink",
+        "\\nq",
 		"\\o",
 		"\\p", "\\password", "\\prompt", "\\pset",
 		"\\q", "\\qecho",
@@ -3664,6 +3667,8 @@ psql_completion(const char *text, int start, int end)
 	}
 	else if (TailMatchesCS("\\l*") && !TailMatchesCS("\\lo*"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+	else if (TailMatchesCS("\\nq"))
+		matches = completion_matches(text, complete_from_named_queries_generator);
 	else if (TailMatchesCS("\\password"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_roles);
 	else if (TailMatchesCS("\\pset"))
@@ -4286,6 +4291,41 @@ complete_from_variables(const char *text, const char *prefix, const char *suffix
 	return matches;
 }
 
+static char *
+complete_from_named_queries_generator(const char *text, int state){
+	const char              *nqfile_path = getenv("PGNQFILE");
+	FILE             	    *nqfile;
+	static NQQueryInfo      *queries;
+	NQQueryInfo             *iter;
+	char		 	        *ret;
+	static int 				textlen = 0;
+
+	if (state == 0) {
+		if (nqfile_path == NULL)	return NULL;
+		nqfile = fopen(nqfile_path, "rb");
+		if (errno != 0)		{
+			if (nqfile) fclose(nqfile);
+			return NULL;
+		}
+		queries = NQScanList(nqfile);
+		textlen = strlen(text);
+	}
+	while (queries) {
+		if (strncmp(queries->name, text, textlen) == 0){
+			ret = strdup(queries->name);
+			iter = queries->next;
+			NQQueryInfoDestroy(queries);
+			queries = iter;
+			return ret;
+		} else {
+			iter = queries->next;
+			NQQueryInfoDestroy(queries);
+			queries = iter;
+		}
+	}
+
+	return NULL;
+}
 
 /*
  * This function wraps rl_filename_completion_function() to strip quotes from

@@ -43,6 +43,7 @@
 #include "psqlscanslash.h"
 #include "settings.h"
 #include "variables.h"
+#include "nqscan.h"
 
 /*
  * Editable database object types.
@@ -100,6 +101,8 @@ static backslashResult exec_command_list(PsqlScanState scan_state, bool active_b
 										 const char *cmd);
 static backslashResult exec_command_lo(PsqlScanState scan_state, bool active_branch,
 									   const char *cmd);
+static backslashResult exec_command_nq(PsqlScanState scan_state, bool active_branch,
+                     const char *cmd, PQExpBuffer query_buffer, PQExpBuffer previous_buf);
 static backslashResult exec_command_out(PsqlScanState scan_state, bool active_branch);
 static backslashResult exec_command_print(PsqlScanState scan_state, bool active_branch,
 										  PQExpBuffer query_buf, PQExpBuffer previous_buf);
@@ -163,7 +166,7 @@ static void printSSLInfo(void);
 static void printGSSInfo(void);
 static bool printPsetInfo(const char *param, struct printQueryOpt *popt);
 static char *pset_value_string(const char *param, struct printQueryOpt *popt);
-
+static void print_detailed_nq(NQQueryInfo *result);
 #ifdef WIN32
 static void checkWin32Codepage(void);
 #endif
@@ -355,6 +358,8 @@ exec_command(const char *cmd,
 		status = exec_command_list(scan_state, active_branch, cmd);
 	else if (strncmp(cmd, "lo_", 3) == 0)
 		status = exec_command_lo(scan_state, active_branch, cmd);
+  else if (strncmp(cmd, "nq", 2) == 0)
+    status = exec_command_nq(scan_state, active_branch, cmd, query_buf, previous_buf);
 	else if (strcmp(cmd, "o") == 0 || strcmp(cmd, "out") == 0)
 		status = exec_command_out(scan_state, active_branch);
 	else if (strcmp(cmd, "p") == 0 || strcmp(cmd, "print") == 0)
@@ -1764,6 +1769,134 @@ exec_command_lo(PsqlScanState scan_state, bool active_branch, const char *cmd)
 	return status;
 }
 
+static backslashResult
+exec_command_nq(PsqlScanState scan_state, bool active_branch, const char *cmd, PQExpBuffer query_buffer, PQExpBuffer previous_buf)
+{
+  backslashResult  result = PSQL_CMD_SKIP_LINE;
+  bool              show_detailed;
+  char             *args[32] = {0}; /* optional arguments */
+  char             *arg = NULL;
+  const char       *nqfile_path = getenv("PGNQFILE");
+  FILE             *nqfile;
+  char	           *nqname = NULL;  /* optional query name */
+  int               argc = 0;     /* nb of arguments */
+  int               scanerr = 0;
+  NQQueryInfo      *scanresult;
+  NQQueryInfo      *iter;
+  int               i = 0;
+  errno = 0;
+
+  if (!active_branch) 
+  	return result;
+
+  show_detailed = strchr(cmd, '+') != NULL;
+
+  if (nqfile_path == NULL) {
+    pg_log_error("%s", "Env variable 'PGNQFILE' isn't pointing to anything.");
+    return false;
+  }
+
+  nqfile = fopen(nqfile_path, "rb");
+
+  if (errno != 0){
+    pg_log_error("Couldn't open PGNQFILE. Check 'PGNQFILE' is set correctly, and is accessible. %s", strerror(errno));
+	if (nqfile) 
+		fclose(nqfile);
+    return PSQL_CMD_ERROR;
+  }
+
+  Assert(nqfile != NULL);
+
+  nqname = psql_scan_slash_option(scan_state, OT_NORMAL, NULL, true);
+  if (nqname != NULL && !show_detailed){
+    arg = psql_scan_slash_option(scan_state, OT_NORMAL, NULL, true);
+    for (; arg != NULL && argc < 32; argc++) {
+      args[argc] = arg;
+      arg = psql_scan_slash_option(scan_state, OT_NORMAL, NULL, true);
+    }
+    scanresult = NQScanExecute(nqfile, nqname, (const char **) args, argc, &scanerr);
+	if (scanresult != NULL && scanerr == 0) {
+		appendPQExpBufferStr(query_buffer, scanresult->value);
+		result = PSQL_CMD_SEND;
+	} else if (scanresult == NULL && scanerr == 0) {
+		puts("Not found.");
+		result = PSQL_CMD_ERROR;
+	} else {
+		result = PSQL_CMD_ERROR;
+	}
+	if (scanresult != NULL) 
+		NQQueryInfoDestroy(scanresult);
+
+  } else if (nqname != NULL && show_detailed) {
+    scanresult = NQScanFind(nqfile, nqname);
+	if (scanresult != NULL){
+		puts(scanresult->value);
+		NQQueryInfoDestroy(scanresult);
+	} else {
+		puts("Not found.");
+	}
+
+  } else if (nqname == NULL && !show_detailed){
+    scanresult = NQScanList(nqfile);
+	for(; scanresult != NULL; scanresult = iter, i++){
+		puts(scanresult->name);
+		iter = scanresult->next;
+		NQQueryInfoDestroy(scanresult);
+	}
+	if (i == 0) 
+		puts("No queries found.");
+
+  } else if (nqname == NULL && show_detailed){
+    scanresult = NQScanDetailed(nqfile);
+	print_detailed_nq(scanresult);
+  } else {
+      Assert(false);
+  }
+  if (nqname != NULL) 
+  	free(nqname);
+  if (argc > 0){
+    for (int i = 0; i < argc; i++)
+		free(args[i]);
+  }
+  fclose(nqfile);
+  return result;
+}
+
+static void
+print_detailed_nq(NQQueryInfo *result){
+	NQQueryInfo            *iter;
+	NQQueryInfo            *head = result;
+	printTableContent       cont;
+  	int                     i = 0;
+	if (result != NULL){
+		
+		for(; result != NULL; result = iter, i++){
+			Assert(result->name != NULL);
+			Assert(result->value != NULL);
+			iter = result->next;
+			i++;
+		}
+
+		printTableInit(&cont, &pset.popt.topt, "List named queries", 2, i);
+		printTableAddHeader(&cont, "Name", false, 'l');
+		printTableAddHeader(&cont, "Definition", false, 'l');
+
+		result = head;
+		for(; result != NULL; result = iter, i++){
+			printTableAddCell(&cont, result->name, false, false);
+			printTableAddCell(&cont, result->value, false, false);
+			iter = result->next;
+		}
+
+		printTable(&cont, stdout, false, NULL);
+		printTableCleanup(&cont);
+		
+		result = head;
+		for(; result != NULL; result = iter, i++){
+			NQQueryInfoDestroy(result);
+		}
+	}
+}
 /*
  * \o -- set query output
  */
